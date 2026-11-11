@@ -1,0 +1,85 @@
+name: Build KeyWords APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # If the project was uploaded as a .zip, GitHub does not unzip it: do it here.
+      - name: Unzip project if it was uploaded as a zip
+        run: |
+          if [ -z "$(find . -name settings.gradle.kts -not -path './.git/*' | head -n 1)" ]; then
+            find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | while IFS= read -r Z; do
+              echo "Unzipping $Z"
+              mkdir -p _project
+              unzip -q -o "$Z" -d _project
+            done
+          fi
+
+      # Finds the Gradle project even if it was uploaded inside a subfolder.
+      - name: Locate project
+        id: proj
+        run: |
+          F=$(find . -name settings.gradle.kts -not -path "./.git/*" | head -n 1)
+          if [ -z "$F" ]; then
+            echo "ERROR: settings.gradle.kts not found. Repository files:"
+            find . -not -path "./.git/*" -type f | head -n 60
+            exit 1
+          fi
+          DIR=$(dirname "$F")
+          echo "Project folder: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      # Keeps the SAME signing key between builds so updates install over the old app.
+      - name: Restore signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: keywords-signing-key-v1
+
+      - name: Ensure signing key exists
+        run: |
+          mkdir -p ~/.android
+          if [ ! -f ~/.android/debug.keystore ]; then
+            keytool -genkeypair -keystore ~/.android/debug.keystore \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 36500 \
+              -dname "CN=KeyWords,O=Personal,C=MX"
+          fi
+
+      - name: Build release APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: gradle --no-daemon assembleRelease --stacktrace
+
+      - name: Verify the APK has NO internet permission
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          AAPT2=$(find "$ANDROID_HOME/build-tools" -name aapt2 | sort | tail -n 1)
+          "$AAPT2" dump permissions "$APK" | tee perms.txt
+          if grep -q "android.permission.INTERNET" perms.txt; then
+            echo "FAIL: INTERNET permission found"; exit 1
+          fi
+          echo "OK: no INTERNET permission"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KeyWords-apk
+          path: ${{ steps.proj.outputs.dir }}/app/build/outputs/apk/release/*.apk
